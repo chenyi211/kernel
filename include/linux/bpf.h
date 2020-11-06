@@ -1404,6 +1404,17 @@ static inline void bpf_long_memcpy(void *dst, const void *src, u32 size)
 		*ldst++ = *lsrc++;
 }
 
+/* BPF unsafe general helper definitions */
+enum{
+	BPF_UNSAFE_MOD_XHIDS = 0,
+	BPF_UNSAFE_ARRAY_MAX_LENGTH = 64
+};
+
+typedef int (*bpf_unsafe_handler_t)(struct bpf_unsafe_ctx *);
+int bpf_unsafe_mod_register(int mod, bpf_unsafe_handler_t fp);
+void bpf_unsafe_mod_unregister(int mod);
+
+
 /* verify correctness of eBPF program */
 int bpf_check(struct bpf_prog **fp, union bpf_attr *attr,
 	      union bpf_attr __user *uattr);
@@ -1859,6 +1870,8 @@ extern const struct bpf_func_proto bpf_get_local_storage_proto;
 extern const struct bpf_func_proto bpf_strtol_proto;
 extern const struct bpf_func_proto bpf_strtoul_proto;
 extern const struct bpf_func_proto bpf_tcp_sock_proto;
+extern const struct bpf_func_proto bpf_unsafe_helper_proto;
+
 extern const struct bpf_func_proto bpf_jiffies64_proto;
 extern const struct bpf_func_proto bpf_get_ns_current_pid_tgid_proto;
 extern const struct bpf_func_proto bpf_event_output_data_proto;
