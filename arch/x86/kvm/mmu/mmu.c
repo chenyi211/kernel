@@ -3238,6 +3238,12 @@ static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
 	u8 shadow_root_level = mmu->shadow_root_level;
 	hpa_t root;
 	unsigned i;
+	int r;
+
+	spin_lock(&vcpu->kvm->mmu_lock);
+	r = make_mmu_pages_available(vcpu);
+	if (r < 0)
+		goto out_unlock;
 
 	if (vcpu->kvm->arch.tdp_mmu_enabled) {
 		root = kvm_tdp_mmu_get_vcpu_root_hpa(vcpu);
@@ -3253,8 +3259,10 @@ static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
 			return -ENOSPC;
 		mmu->root_hpa = root;
 	} else if (shadow_root_level == PT32E_ROOT_LEVEL) {
-		if (WARN_ON_ONCE(!mmu->pae_root))
-			return -EIO;
+		if (WARN_ON_ONCE(!mmu->pae_root)) {
+			r = -EIO;
+			goto out_unlock;
+		}
 
 		for (i = 0; i < 4; ++i) {
 			MMU_WARN_ON(VALID_PAGE(mmu->pae_root[i]));
@@ -3269,13 +3277,15 @@ static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
 		mmu->root_hpa = __pa(mmu->pae_root);
 	} else {
 		WARN_ONCE(1, "Bad TDP root level = %d\n", shadow_root_level);
-		return -EIO;
+		r = -EIO;
+		goto out_unlock;
 	}
 
 	/* root_pgd is ignored for direct MMUs. */
 	mmu->root_pgd = 0;
-
-	return 0;
+out_unlock:
+	spin_unlock(&vcpu->kvm->mmu_lock);
+	return r;
 }
 
 static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
@@ -3284,13 +3294,19 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
 	u64 pdptr, pm_mask;
 	gfn_t root_gfn, root_pgd;
 	hpa_t root;
-	int i;
+	unsigned i;
+	int r;
 
 	root_pgd = mmu->get_guest_pgd(vcpu);
 	root_gfn = root_pgd >> PAGE_SHIFT;
 
 	if (mmu_check_root(vcpu, root_gfn))
 		return 1;
+
+	spin_lock(&vcpu->kvm->mmu_lock);
+	r = make_mmu_pages_available(vcpu);
+	if (r < 0)
+		goto out_unlock;
 
 	/*
 	 * Do we shadow a long mode page table? If so we need to
@@ -3307,8 +3323,10 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
 		goto set_root_pgd;
 	}
 
-	if (WARN_ON_ONCE(!mmu->pae_root))
-		return -EIO;
+	if (WARN_ON_ONCE(!mmu->pae_root)) {
+		r = -EIO;
+		goto out_unlock;
+	}
 
 	/*
 	 * We shadow a 32 bit page table. This may be a legacy 2-level
@@ -3319,8 +3337,10 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
 	if (mmu->shadow_root_level == PT64_ROOT_4LEVEL) {
 		pm_mask |= PT_ACCESSED_MASK | PT_WRITABLE_MASK | PT_USER_MASK;
 
-		if (WARN_ON_ONCE(!mmu->lm_root))
-			return -EIO;
+		if (WARN_ON_ONCE(!mmu->lm_root)) {
+			r = -EIO;
+			goto out_unlock;
+		}
 
 		mmu->lm_root[0] = __pa(mmu->pae_root) | pm_mask;
 	}
@@ -3352,6 +3372,8 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
 
 set_root_pgd:
 	mmu->root_pgd = root_pgd;
+out_unlock:
+	spin_unlock(&vcpu->kvm->mmu_lock);
 
 	return 0;
 }
