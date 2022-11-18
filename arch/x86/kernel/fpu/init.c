@@ -133,8 +133,14 @@ static void __init fpu__init_system_generic(void)
 	fpu__init_system_mxcsr();
 }
 
-/* Get alignment of the TYPE. */
-#define TYPE_ALIGN(TYPE) offsetof(struct { char x; TYPE test; }, test)
+/*
+ * Size of the FPU context state. All tasks in the system use the
+ * same context size, regardless of what portion they use.
+ * This is inherent to the XSAVE architecture which puts all state
+ * components into a single, continuous memory block:
+ */
+unsigned int fpu_kernel_xstate_size;
+EXPORT_SYMBOL_GPL(fpu_kernel_xstate_size);
 
 /*
  * Enforce that 'MEMBER' is the last field of 'TYPE'.
@@ -143,8 +149,8 @@ static void __init fpu__init_system_generic(void)
  * because that's how C aligns structs.
  */
 #define CHECK_MEMBER_AT_END_OF(TYPE, MEMBER) \
-	BUILD_BUG_ON(sizeof(TYPE) != ALIGN(offsetofend(TYPE, MEMBER), \
-					   TYPE_ALIGN(TYPE)))
+	BUILD_BUG_ON(sizeof(TYPE) !=         \
+		     ALIGN(offsetofend(TYPE, MEMBER), _Alignof(TYPE)))
 
 /*
  * We append the 'struct fpu' to the task_struct:
