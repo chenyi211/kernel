@@ -4,6 +4,7 @@
 
 #include <linux/bits.h>
 #include <linux/ctype.h>
+#include <linux/string_choices.h>
 #include <linux/types.h>
 
 struct file;

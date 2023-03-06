@@ -7910,6 +7910,7 @@ F:	drivers/input/touchscreen/resistive-adc-touch.c
 GENERIC STRING LIBRARY
 R:	Andy Shevchenko <andy@kernel.org>
 S:	Maintained
+F:	include/linux/string_choices.h
 F:	lib/string.c
 F:	lib/string_helpers.c
 F:	lib/test_string.c
