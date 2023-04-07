@@ -63,6 +63,12 @@ Transmit path guidelines:
 	    TX_BUFFS_AVAIL(dp) > 0)
 		netif_wake_queue(dp->dev);
 
+Lockless queue stop / wake helper macros
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. kernel-doc:: include/net/netdev_queues.h
+   :doc: Lockless queue stopping / waking helpers.
+
 2) An ndo_start_xmit method must not modify the shared parts of a
    cloned SKB.
 
