@@ -8035,7 +8035,7 @@ static int tg_set_cfs_quota(struct task_group *tg, long cfs_quota_us)
 	return tg_set_cfs_bandwidth(tg, period, quota);
 }
 
-static long tg_get_cfs_quota(struct task_group *tg)
+long tg_get_cfs_quota(struct task_group *tg)
 {
 	u64 quota_us;
 
@@ -8047,6 +8047,7 @@ static long tg_get_cfs_quota(struct task_group *tg)
 
 	return quota_us;
 }
+EXPORT_SYMBOL(tg_get_cfs_quota);
 
 static int tg_set_cfs_period(struct task_group *tg, long cfs_period_us)
 {
@@ -8061,7 +8062,7 @@ static int tg_set_cfs_period(struct task_group *tg, long cfs_period_us)
 	return tg_set_cfs_bandwidth(tg, period, quota);
 }
 
-static long tg_get_cfs_period(struct task_group *tg)
+long tg_get_cfs_period(struct task_group *tg)
 {
 	u64 cfs_period_us;
 
@@ -8070,6 +8071,7 @@ static long tg_get_cfs_period(struct task_group *tg)
 
 	return cfs_period_us;
 }
+EXPORT_SYMBOL(tg_get_cfs_period);
 
 static s64 cpu_cfs_quota_read_s64(struct cgroup_subsys_state *css,
 				  struct cftype *cft)
