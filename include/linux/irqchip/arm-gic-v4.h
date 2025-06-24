@@ -34,6 +34,8 @@ struct its_vm {
 	 */
 	raw_spinlock_t		vmapp_lock;
 	u32			vlpi_count[GICv4_ITS_LIST_MAX];
+	struct page         *vpeid_page;
+	bool                  nassgireq;
 };
 
 /* Embedded in kvm_vcpu.arch */
@@ -65,7 +67,12 @@ struct its_vpe {
 				u8	priority;
 				bool	enabled;
 				bool	group;
-			}			sgi_config[16];
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+			}			sgi_config[32];
+			int nr_irqs;
+#else
+			}                       sgi_config[16];
+#endif
 		};
 	};
 
@@ -154,6 +161,10 @@ struct irq_domain_ops;
 int its_init_v4(struct irq_domain *domain,
 		const struct irq_domain_ops *vpe_ops,
 		const struct irq_domain_ops *sgi_ops);
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+int vtimer_irqbypass_init(struct irq_domain *domain,
+		bool has_vtimer_irqbypass);
+#endif
 
 bool gic_cpuif_has_vsgi(void);
 

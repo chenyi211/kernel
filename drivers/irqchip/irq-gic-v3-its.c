@@ -39,6 +39,104 @@
 
 #include "irq-gic-common.h"
 
+#ifdef CONFIG_VIRT_PLAT_DEV
+#include <linux/pci.h>
+
+/* a reserved bus id region */
+struct plat_rsv_buses {
+	u8	start;	/* the first reserved bus id */
+	u8	count;
+};
+
+/*
+ * Build a devid pool per reserved bus id region, where all
+ * device ids should be unused by physical PCI devices.
+ */
+struct rsv_devid_pool {
+	struct list_head	entry;
+
+	struct plat_rsv_buses	buses;
+	u32			start;
+	u32			end;
+
+	raw_spinlock_t		devid_bm_lock;
+	unsigned long		*devid_bm;
+};
+
+static LIST_HEAD(rsv_devid_pools);
+static DEFINE_RAW_SPINLOCK(rsv_devid_pools_lock);
+
+/* Do we have usable rsv_devid_pool? Initialized to be true. */
+bool rsv_devid_pool_cap = true;
+static u8 rsv_buses_start, rsv_buses_count;
+
+static int __init rsv_buses_start_cfg(char *buf)
+{
+	return kstrtou8(buf, 0, &rsv_buses_start);
+}
+early_param("irqchip.gicv3_rsv_buses_start", rsv_buses_start_cfg);
+
+static int __init rsv_buses_count_cfg(char *buf)
+{
+	return kstrtou8(buf, 0, &rsv_buses_count);
+}
+early_param("irqchip.gicv3_rsv_buses_count", rsv_buses_count_cfg);
+
+static void get_rsv_buses_resource(struct plat_rsv_buses *buses)
+{
+	buses->start = rsv_buses_start;
+	buses->count = rsv_buses_count;
+
+	/*
+	 * FIXME: There is no architectural way to get the *correct*
+	 * reserved bus id info.
+	 *
+	 * The first thought is to increase the GITS_TYPER.Devbits for
+	 * the usage for virtualization, but this will break all
+	 * command layouts with DeviceID as an argument (e.g., INT).
+	 *
+	 * The second way is to decrease the GITS_TYPER.Devids so that
+	 * SW can pick the unused device IDs for use (these IDs should
+	 * actually be supported at HW level, though not exposed).
+	 * *Or* fetch the information with the help of firmware. They
+	 * are essentially the same way.
+	 */
+}
+
+static int probe_devid_pool_one(void)
+{
+	struct rsv_devid_pool *devid_pool;
+
+	devid_pool = kzalloc(sizeof(*devid_pool), GFP_KERNEL);
+	if (!devid_pool)
+		return -ENOMEM;
+
+	get_rsv_buses_resource(&devid_pool->buses);
+	raw_spin_lock_init(&devid_pool->devid_bm_lock);
+
+	devid_pool->start = PCI_DEVID(devid_pool->buses.start, 0);
+	devid_pool->end = PCI_DEVID(devid_pool->buses.start + devid_pool->buses.count, 0);
+
+	if (devid_pool->end == devid_pool->start) {
+		kfree(devid_pool);
+		return -EINVAL;
+	}
+
+	devid_pool->devid_bm = bitmap_zalloc(devid_pool->end - devid_pool->start,
+					     GFP_KERNEL);
+	if (!devid_pool->devid_bm) {
+		kfree(devid_pool);
+		return -ENOMEM;
+	}
+
+	raw_spin_lock(&rsv_devid_pools_lock);
+	list_add(&devid_pool->entry, &rsv_devid_pools);
+	raw_spin_unlock(&rsv_devid_pools_lock);
+
+	return 0;
+}
+#endif
+
 #define ITS_FLAGS_CMDQ_NEEDS_FLUSHING		(1ULL << 0)
 #define ITS_FLAGS_WORKAROUND_CAVIUM_22375	(1ULL << 1)
 #define ITS_FLAGS_WORKAROUND_CAVIUM_23144	(1ULL << 2)
@@ -118,12 +216,34 @@ struct its_node {
 	int			numa_node;
 	unsigned int		msi_domain_flags;
 	u32			pre_its_base; /* for Socionext Synquacer */
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	u32			version;
+#endif
 	int			vlpi_redist_offset;
 };
 
 #define is_v4(its)		(!!((its)->typer & GITS_TYPER_VLPIS))
 #define is_v4_1(its)		(!!((its)->typer & GITS_TYPER_VMAPP))
 #define device_ids(its)		(FIELD_GET(GITS_TYPER_DEVBITS, (its)->typer) + 1)
+
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+#define is_vtimer_irqbypass(its)	(!!((its)->version & GITS_VERSION_VTIMER))
+
+/* Fetch it from gtdt->virtual_timer_interrupt. */
+#define is_vtimer_irq(irq)	((irq) == 27)
+
+static inline bool is_its_vsgi_cmd_valid(struct its_node *its, u8 hwirq)
+{
+	if (__get_intid_range(hwirq) == SGI_RANGE)
+		return true;
+
+	/* For PPI range, only vtimer interrupt is supported atm. */
+	if (is_vtimer_irq(hwirq) && is_vtimer_irqbypass(its))
+		return true;
+
+	return false;
+}
+#endif
 
 #define ITS_ITT_ALIGN		SZ_256
 
@@ -168,6 +288,12 @@ struct its_device {
 	u32			nr_ites;
 	u32			device_id;
 	bool			shared;
+
+#ifdef CONFIG_VIRT_PLAT_DEV
+	/* For virtual devices which needed the devid managed */
+	bool			is_vdev;
+	struct rsv_devid_pool	*devid_pool;
+#endif
 };
 
 static struct {
@@ -195,10 +321,82 @@ static DEFINE_RAW_SPINLOCK(vmovp_lock);
 
 static DEFINE_IDA(its_vpeid_ida);
 
+#ifdef CONFIG_VIRT_PLAT_DEV
+static void free_devid_to_rsv_pools(struct its_device *its_dev)
+{
+	struct rsv_devid_pool *pool = its_dev->devid_pool;
+	u32 id, size;
+
+	WARN_ON(!pool);
+
+	id = its_dev->device_id - pool->start;
+	size = pool->end - pool->start;
+	WARN_ON(id >= size);
+
+	raw_spin_lock(&pool->devid_bm_lock);
+	clear_bit(id, pool->devid_bm);
+	raw_spin_unlock(&pool->devid_bm_lock);
+
+	pr_debug("ITS: free devid (%u) to rsv_devid_pools\n", its_dev->device_id);
+}
+
+static int alloc_devid_from_rsv_pools(struct rsv_devid_pool **devid_pool,
+				      u32 *dev_id)
+{
+	struct rsv_devid_pool *pool;
+	int err = -ENOSPC;
+
+	raw_spin_lock(&rsv_devid_pools_lock);
+	list_for_each_entry(pool, &rsv_devid_pools, entry) {
+		u32 size, id;
+
+		size = pool->end - pool->start;
+
+		raw_spin_lock(&pool->devid_bm_lock);
+		id = find_first_zero_bit(pool->devid_bm, size);
+		if (id >= size) {
+			/* No usable device id in this pool, try next. */
+			raw_spin_unlock(&pool->devid_bm_lock);
+			continue;
+		}
+
+		*dev_id = pool->start + id;
+		set_bit(id, pool->devid_bm);
+		raw_spin_unlock(&pool->devid_bm_lock);
+
+		*devid_pool = pool;
+		err = 0;
+		break;
+	}
+	raw_spin_unlock(&rsv_devid_pools_lock);
+
+	pr_debug("ITS: alloc devid (%u) from rsv_devid_pools\n", *dev_id);
+	return err;
+}
+#endif
+
 #define gic_data_rdist()		(raw_cpu_ptr(gic_rdists->rdist))
 #define gic_data_rdist_cpu(cpu)		(per_cpu_ptr(gic_rdists->rdist, cpu))
 #define gic_data_rdist_rd_base()	(gic_data_rdist()->rd_base)
 #define gic_data_rdist_vlpi_base()	(gic_data_rdist_rd_base() + SZ_128K)
+
+extern struct static_key_false ipiv_enable;
+
+#ifdef CONFIG_VIRT_PLAT_DEV
+/*
+ * Currently we only build *one* devid pool.
+ */
+static int build_devid_pools(void)
+{
+	struct its_node *its;
+
+	its = list_first_entry(&its_nodes, struct its_node, entry);
+	if (readl_relaxed(its->base + GITS_IIDR) != 0x00051736)
+		return -EINVAL;
+
+	return probe_devid_pool_one();
+}
+#endif
 
 /*
  * Skip ITSs that have no vLPIs mapped, unless we're on GICv4.1, as we
@@ -584,6 +782,18 @@ static void its_encode_sgi_intid(struct its_cmd_block *cmd, u8 sgi)
 {
 	its_mask_encode(&cmd->raw_cmd[0], sgi, 35, 32);
 }
+
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+static void its_encode_sgi_intid_extension(struct its_cmd_block *cmd, u8 sgi)
+{
+	/*
+	 * We reuse the VSGI command in this implementation to configure
+	 * the vPPI or clear its pending state. The vINTID field has been
+	 * therefore extended to [36:32].
+	 */
+	its_mask_encode(&cmd->raw_cmd[0], sgi, 36, 32);
+}
+#endif
 
 static void its_encode_sgi_priority(struct its_cmd_block *cmd, u8 prio)
 {
@@ -990,7 +1200,14 @@ static struct its_vpe *its_build_vsgi_cmd(struct its_node *its,
 
 	its_encode_cmd(cmd, GITS_CMD_VSGI);
 	its_encode_vpeid(cmd, desc->its_vsgi_cmd.vpe->vpe_id);
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	if (!is_vtimer_irqbypass(its))
+		its_encode_sgi_intid(cmd, desc->its_vsgi_cmd.sgi);
+	else
+		its_encode_sgi_intid_extension(cmd, desc->its_vsgi_cmd.sgi);
+#else
 	its_encode_sgi_intid(cmd, desc->its_vsgi_cmd.sgi);
+#endif
 	its_encode_sgi_priority(cmd, desc->its_vsgi_cmd.priority);
 	its_encode_sgi_group(cmd, desc->its_vsgi_cmd.group);
 	its_encode_sgi_clear(cmd, desc->its_vsgi_cmd.clear);
@@ -3464,6 +3681,13 @@ static void its_free_device(struct its_device *its_dev)
 	raw_spin_unlock_irqrestore(&its_dev->its->lock, flags);
 	kfree(its_dev->event_map.col_map);
 	kfree(its_dev->itt);
+
+#ifdef CONFIG_VIRT_PLAT_DEV
+	if (its_dev->is_vdev) {
+		WARN_ON(!rsv_devid_pool_cap);
+		free_devid_to_rsv_pools(its_dev);
+	}
+#endif
 	kfree(its_dev);
 }
 
@@ -3500,6 +3724,23 @@ static int its_msi_prepare(struct irq_domain *domain, struct device *dev,
 	 */
 	dev_id = info->scratchpad[0].ul;
 
+#ifdef CONFIG_VIRT_PLAT_DEV
+	int use_devid_pool = false;
+	struct rsv_devid_pool *pool = NULL;
+
+	if (rsv_devid_pool_cap && !dev->of_node && !dev->fwnode &&
+	    info->scratchpad[0].ul == -1)
+		use_devid_pool = true;
+
+	if (use_devid_pool) {
+		err = alloc_devid_from_rsv_pools(&pool, &dev_id);
+		if (err) {
+			pr_warn("ITS: No remaining device id\n");
+			return err;
+		}
+	}
+#endif
+
 	msi_info = msi_get_domain_info(domain);
 	its = msi_info->data;
 
@@ -3516,6 +3757,10 @@ static int its_msi_prepare(struct irq_domain *domain, struct device *dev,
 	mutex_lock(&its->dev_alloc_lock);
 	its_dev = its_find_device(its, dev_id);
 	if (its_dev) {
+#ifdef CONFIG_VIRT_PLAT_DEV
+		/* Impossible ...*/
+		WARN_ON_ONCE(use_devid_pool);
+#endif
 		/*
 		 * We already have seen this ID, probably through
 		 * another alias (PCI bridge of some sort). No need to
@@ -3536,6 +3781,13 @@ static int its_msi_prepare(struct irq_domain *domain, struct device *dev,
 		its_dev->shared = true;
 
 	pr_debug("ITT %d entries, %d bits\n", nvec, ilog2(nvec));
+
+#ifdef CONFIG_VIRT_PLAT_DEV
+	if (use_devid_pool) {
+		its_dev->is_vdev = true;
+		its_dev->devid_pool = pool;
+	}
+#endif
 out:
 	mutex_unlock(&its->dev_alloc_lock);
 	info->scratchpad[0].ptr = its_dev;
@@ -4128,11 +4380,69 @@ static void its_vpe_4_1_unmask_irq(struct irq_data *d)
 	its_vpe_4_1_send_inv(d);
 }
 
+/* IPIV private register */
+#define CPU_SYS_TRAP_EL2		sys_reg(3, 4, 15, 7, 2)
+#define CPU_SYS_TRAP_EL2_IPIV_ENABLE_SHIFT	0
+#define CPU_SYS_TRAP_EL2_IPIV_ENABLE		\
+	(1ULL << CPU_SYS_TRAP_EL2_IPIV_ENABLE_SHIFT)
+
+/*
+ * ipiv_disable_vsgi_trap and ipiv_enable_vsgi_trap run only
+ * in VHE mode and in EL2.
+ */
+static void ipiv_disable_vsgi_trap(void)
+{
+#ifdef CONFIG_ARM64
+	u64 val;
+
+	/* disable guest access ICC_SGI1R_EL1 trap, enable ipiv */
+	val = read_sysreg_s(CPU_SYS_TRAP_EL2);
+	val |= CPU_SYS_TRAP_EL2_IPIV_ENABLE;
+	write_sysreg_s(val, CPU_SYS_TRAP_EL2);
+#endif
+}
+
+static void ipiv_enable_vsgi_trap(void)
+{
+#ifdef CONFIG_ARM64
+	u64 val;
+
+	/* enable guest access ICC_SGI1R_EL1 trap, disable ipiv */
+	val = read_sysreg_s(CPU_SYS_TRAP_EL2);
+	val &= ~CPU_SYS_TRAP_EL2_IPIV_ENABLE;
+	write_sysreg_s(val, CPU_SYS_TRAP_EL2);
+#endif
+}
+
 static void its_vpe_4_1_schedule(struct its_vpe *vpe,
 				 struct its_cmd_info *info)
 {
 	void __iomem *vlpi_base = gic_data_rdist_vlpi_base();
+	struct its_vm *vm = vpe->its_vm;
+	unsigned long vpeid_page_addr;
+	u64 ipiv_val = 0;
 	u64 val = 0;
+	u32 nr_vpes;
+
+	if (static_branch_unlikely(&ipiv_enable) &&
+	    vm->nassgireq) {
+		/* wait gicr_ipiv_busy */
+		WARN_ON_ONCE(readl_relaxed_poll_timeout_atomic(vlpi_base + GICR_IPIV_ST,
+					ipiv_val, !(ipiv_val & GICR_IPIV_ST_IPIV_BUSY), 1, 500));
+		vpeid_page_addr = virt_to_phys(page_address(vm->vpeid_page));
+		writel_relaxed(lower_32_bits(vpeid_page_addr),
+					vlpi_base + GICR_VM_TABLE_BAR_L);
+		writel_relaxed(upper_32_bits(vpeid_page_addr),
+					vlpi_base + GICR_VM_TABLE_BAR_H);
+
+		/* setup gicr_vcpu_entry_num_max and gicr_ipiv_its_ta_sel */
+		nr_vpes = vpe->its_vm->nr_vpes;
+		ipiv_val = ((nr_vpes - 1) << GICR_IPIV_CTRL_VCPU_ENTRY_NUM_MAX_SHIFT) |
+			(0 << GICR_IPIV_CTRL_IPIV_ITS_TA_SEL_SHIFT);
+		writel_relaxed(ipiv_val, vlpi_base + GICR_IPIV_CTRL);
+
+		ipiv_disable_vsgi_trap();
+	}
 
 	/* Schedule the VPE */
 	val |= GICR_VPENDBASER_Valid;
@@ -4147,6 +4457,7 @@ static void its_vpe_4_1_deschedule(struct its_vpe *vpe,
 				   struct its_cmd_info *info)
 {
 	void __iomem *vlpi_base = gic_data_rdist_vlpi_base();
+	struct its_vm *vm = vpe->its_vm;
 	u64 val;
 
 	if (info->req_db) {
@@ -4177,6 +4488,17 @@ static void its_vpe_4_1_deschedule(struct its_vpe *vpe,
 					    0,
 					    GICR_VPENDBASER_PendingLast);
 		vpe->pending_last = true;
+	}
+
+	if (static_branch_unlikely(&ipiv_enable) &&
+	    vm->nassgireq) {
+		/* wait gicr_ipiv_busy */
+		WARN_ON_ONCE(readl_relaxed_poll_timeout_atomic(vlpi_base + GICR_IPIV_ST,
+					val, !(val & GICR_IPIV_ST_IPIV_BUSY), 1, 500));
+		writel_relaxed(0, vlpi_base + GICR_VM_TABLE_BAR_L);
+		writel_relaxed(0, vlpi_base + GICR_VM_TABLE_BAR_H);
+
+		ipiv_enable_vsgi_trap();
 	}
 }
 
@@ -4231,6 +4553,14 @@ static void its_configure_sgi(struct irq_data *d, bool clear)
 {
 	struct its_vpe *vpe = irq_data_get_irq_chip_data(d);
 	struct its_cmd_desc desc;
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	struct its_node *its = find_4_1_its();
+
+	if (!its || !is_its_vsgi_cmd_valid(its, d->hwirq)) {
+		pr_err("ITS: %s failed\n", __func__);
+		return;
+	}
+#endif
 
 	desc.its_vsgi_cmd.vpe = vpe;
 	desc.its_vsgi_cmd.sgi = d->hwirq;
@@ -4244,7 +4574,11 @@ static void its_configure_sgi(struct irq_data *d, bool clear)
 	 * destination VPE is mapped there. Since we map them eagerly at
 	 * activation time, we're pretty sure the first GICv4.1 ITS will do.
 	 */
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	its_send_single_vcommand(its, its_build_vsgi_cmd, &desc);
+#else
 	its_send_single_vcommand(find_4_1_its(), its_build_vsgi_cmd, &desc);
+#endif
 }
 
 static void its_sgi_mask_irq(struct irq_data *d)
@@ -4287,10 +4621,20 @@ static int its_sgi_set_irqchip_state(struct irq_data *d,
 		struct its_vpe *vpe = irq_data_get_irq_chip_data(d);
 		struct its_node *its = find_4_1_its();
 		u64 val;
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+		u64 offset = GITS_SGIR;
+
+		if (__get_intid_range(d->hwirq) == PPI_RANGE)
+			offset = GITS_PPIR;
+#endif
 
 		val  = FIELD_PREP(GITS_SGIR_VPEID, vpe->vpe_id);
 		val |= FIELD_PREP(GITS_SGIR_VINTID, d->hwirq);
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+		writeq_relaxed(val, its->sgir_base + offset - SZ_128K);
+#else
 		writeq_relaxed(val, its->sgir_base + GITS_SGIR - SZ_128K);
+#endif
 	} else {
 		its_configure_sgi(d, true);
 	}
@@ -4311,6 +4655,20 @@ static int its_sgi_get_irqchip_state(struct irq_data *d,
 	if (which != IRQCHIP_STATE_PENDING)
 		return -EINVAL;
 
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	enum gic_intid_range type;
+
+	/*
+	 * Plug the HiSilicon implementation details in comment!
+	 *
+	 * For vPPI, we re-use the GICR_VSGIR and GICR_VSGIPENDR in the
+	 * implementation which allows reads to GICR_I{S,C}PENDR to be
+	 * emulated. And note that the pending state of the vtimer
+	 * interrupt is stored at bit[16] of GICR_VSGIPENDR.
+	 */
+	type = __get_intid_range(d->hwirq);
+	WARN_ON_ONCE(type == PPI_RANGE && !is_vtimer_irq(d->hwirq));
+#endif
 	/*
 	 * Locking galore! We can race against two different events:
 	 *
@@ -4346,7 +4704,14 @@ out:
 	if (!count)
 		return -ENXIO;
 
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	if (is_vtimer_irq(d->hwirq))
+		*val = !!(status & (1 << 16));
+	else
+		*val = !!(status & (1 << d->hwirq));
+#else
 	*val = !!(status & (1 << d->hwirq));
+#endif
 
 	return 0;
 }
@@ -4384,11 +4749,19 @@ static int its_sgi_irq_domain_alloc(struct irq_domain *domain,
 {
 	struct its_vpe *vpe = args;
 	int i;
-
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	/* We may want 32 IRQs if vtimer irqbypass is supported. */
+	WARN_ON(nr_irqs != 16 && nr_irqs != 32);
+#else
 	/* Yes, we do want 16 SGIs */
 	WARN_ON(nr_irqs != 16);
+#endif
 
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	for (i = 0; i < nr_irqs; i++) {
+#else
 	for (i = 0; i < 16; i++) {
+#endif
 		vpe->sgi_config[i].priority = 0;
 		vpe->sgi_config[i].enabled = false;
 		vpe->sgi_config[i].group = false;
@@ -4517,6 +4890,10 @@ static void its_vpe_irq_domain_free(struct irq_domain *domain,
 	if (bitmap_empty(vm->db_bitmap, vm->nr_db_lpis)) {
 		its_lpi_free(vm->db_bitmap, vm->db_lpi_base, vm->nr_db_lpis);
 		its_free_prop_table(vm->vprop_page);
+		if (static_branch_unlikely(&ipiv_enable)) {
+			free_pages((unsigned long)page_address(vm->vpeid_page),
+				    get_order(nr_irqs * 2));
+		}
 	}
 }
 
@@ -4526,8 +4903,10 @@ static int its_vpe_irq_domain_alloc(struct irq_domain *domain, unsigned int virq
 	struct irq_chip *irqchip = &its_vpe_irq_chip;
 	struct its_vm *vm = args;
 	unsigned long *bitmap;
-	struct page *vprop_page;
+	struct page *vprop_page, *vpeid_page;
 	int base, nr_ids, i, err = 0;
+	void *vpeid_table_va;
+	u16 *vpeid_entry;
 
 	bitmap = its_lpi_alloc(roundup_pow_of_two(nr_irqs), &base, &nr_ids);
 	if (!bitmap)
@@ -4550,14 +4929,33 @@ static int its_vpe_irq_domain_alloc(struct irq_domain *domain, unsigned int virq
 	vm->vprop_page = vprop_page;
 	raw_spin_lock_init(&vm->vmapp_lock);
 
-	if (gic_rdists->has_rvpeid)
+	if (gic_rdists->has_rvpeid){
 		irqchip = &its_vpe_4_1_irq_chip;
+		if (static_branch_unlikely(&ipiv_enable)) {
+			/*
+			 * The vpeid's size is 2 bytes, so we need to allocate 2 *
+			 * (num of vcpus). nr_irqs is equal to the number of vCPUs.
+			 */
+			vpeid_page = alloc_pages(GFP_KERNEL, get_order(nr_irqs * 2));
+			if (!vpeid_page) {
+				its_lpi_free(bitmap, base, nr_ids);
+				its_free_prop_table(vprop_page);
+				return -ENOMEM;
+			}
+			vm->vpeid_page = vpeid_page;
+			vpeid_table_va = page_address(vpeid_page);
+		}
+	}
 
 	for (i = 0; i < nr_irqs; i++) {
 		vm->vpes[i]->vpe_db_lpi = base + i;
 		err = its_vpe_init(vm->vpes[i]);
 		if (err)
 			break;
+		if (static_branch_unlikely(&ipiv_enable)) {
+			vpeid_entry = (u16 *)vpeid_table_va + i;
+			*vpeid_entry = vm->vpes[i]->vpe_id;
+		}
 		err = its_irq_gic_domain_alloc(domain, virq + i,
 					       vm->vpes[i]->vpe_db_lpi);
 		if (err)
@@ -5406,6 +5804,10 @@ static struct its_node __init *its_node_init(struct resource *res,
 	its->numa_node = numa_node;
 	its->fwnode_handle = handle;
 
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	if (readl_relaxed(its_base + GITS_IIDR) == 0x00051736)
+		its->version = readl_relaxed(its_base + GITS_VERSION);
+#endif
 	return its;
 
 out_unmap:
@@ -5689,6 +6091,9 @@ int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
 	struct its_node *its;
 	bool has_v4 = false;
 	bool has_v4_1 = false;
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	bool has_vtimer_irqbypass = false;
+#endif
 	int err;
 
 	gic_rdists = rdists;
@@ -5712,11 +6117,22 @@ int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
 	list_for_each_entry(its, &its_nodes, entry) {
 		has_v4 |= is_v4(its);
 		has_v4_1 |= is_v4_1(its);
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+		has_vtimer_irqbypass |= is_vtimer_irqbypass(its);
+#endif
 	}
 
 	/* Don't bother with inconsistent systems */
 	if (WARN_ON(!has_v4_1 && rdists->has_rvpeid))
 		rdists->has_rvpeid = false;
+
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+	/* vtimer irqbypass depends on rvpeid support */
+	if (WARN_ON(!has_v4_1 && has_vtimer_irqbypass)) {
+		has_vtimer_irqbypass = false;
+		rdists->has_vtimer = false;
+	}
+#endif
 
 	if (has_v4 & rdists->has_vlpis) {
 		const struct irq_domain_ops *sgi_ops;
@@ -5727,10 +6143,23 @@ int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
 			sgi_ops = NULL;
 
 		if (its_init_vpe_domain() ||
+#ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
+		    its_init_v4(parent_domain, &its_vpe_domain_ops, sgi_ops) ||
+		    vtimer_irqbypass_init(parent_domain, has_vtimer_irqbypass)) {
+#else
 		    its_init_v4(parent_domain, &its_vpe_domain_ops, sgi_ops)) {
+#endif
 			rdists->has_vlpis = false;
 			pr_err("ITS: Disabling GICv4 support\n");
 		}
+
+#ifdef CONFIG_VIRT_PLAT_DEV
+		if (build_devid_pools())
+			rsv_devid_pool_cap = false;
+
+		if (rsv_devid_pool_cap)
+			pr_info("ITS: reserved device id pools enabled\n");
+#endif
 	}
 
 	register_syscore_ops(&its_syscore_ops);
