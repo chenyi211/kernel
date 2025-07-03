@@ -693,6 +693,7 @@ static int acpi_thermal_cooling_device_cb(struct thermal_zone_device *thermal,
 	struct acpi_device *device = cdev->devdata;
 	struct acpi_thermal *tz = thermal->devdata;
 	struct acpi_device *dev;
+	acpi_status status;
 	acpi_handle handle;
 	int i;
 	int j;
@@ -710,8 +711,8 @@ static int acpi_thermal_cooling_device_cb(struct thermal_zone_device *thermal,
 		for (i = 0; i < tz->trips.passive.devices.count;
 		    i++) {
 			handle = tz->trips.passive.devices.handles[i];
-			dev = acpi_fetch_acpi_dev(handle);
-			if (dev != device)
+			status = acpi_bus_get_device(handle, &dev);
+			if (ACPI_FAILURE(status) || dev != device)
 				continue;
 			if (bind)
 				result =
@@ -736,8 +737,8 @@ static int acpi_thermal_cooling_device_cb(struct thermal_zone_device *thermal,
 		    j < tz->trips.active[i].devices.count;
 		    j++) {
 			handle = tz->trips.active[i].devices.handles[j];
-			dev = acpi_fetch_acpi_dev(handle);
-			if (dev != device)
+			status = acpi_bus_get_device(handle, &dev);
+			if (ACPI_FAILURE(status) || dev != device)
 				continue;
 			if (bind)
 				result = thermal_zone_bind_cooling_device
